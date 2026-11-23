@@ -20,7 +20,7 @@ const BLOCKED_HOSTNAMES = new Set([
   'instance-data',
 ]);
 
-const VIDEO_FILE_EXT_RE = /\.(mp4|webm|ogv|ogg|mov|m4v|m3u8|ts|m4s|m4a|aac)(\?|#|$)/i;
+const VIDEO_FILE_EXT_RE = /\.(mp4|webm|ogv|ogg|mov|m4v|m3u8|ts|m4s|m4a|aac|key)(\?|#|$)/i;
 const HLS_EXT_RE = /\.m3u8(\?|#|$)/i;
 const VALID_RANGE_RE = /^bytes=(\d+-\d*|-\d+)$/;
 
@@ -208,17 +208,15 @@ async function safeFetchFollowingRedirects(initialUrl, init) {
 }
 
 function normalizeProxyRange(rawRange, method, isManifestRequest) {
-  if (method === 'HEAD' || isManifestRequest) return undefined;
-
-  if (!rawRange) {
-    return `bytes=0-${CHUNK_RANGE_SIZE - 1}`;
-  }
+  // Never inject an unsolicited Range header (breaks HLS .m3u8, .ts segments, and AES keys)
+  if (method === 'HEAD' || isManifestRequest || !rawRange) return undefined;
 
   const trimmed = rawRange.trim();
   if (!VALID_RANGE_RE.test(trimmed)) {
-    return `bytes=0-${CHUNK_RANGE_SIZE - 1}`;
+    return undefined;
   }
 
+  // Cap open-ended browser Range requests (bytes=START-) to 3 MB chunks for Vercel compatibility
   const openMatch = trimmed.match(/^bytes=(\d+)-$/);
   if (openMatch) {
     const start = Number(openMatch[1]);
@@ -259,7 +257,7 @@ function isHlsContentType(contentType, urlStr) {
   return false;
 }
 
-function isAllowedMediaContentType(contentType, urlStr) {
+function isAllowedMediaContentType(contentType, urlStr, contentLengthHeader) {
   const lower = contentType.toLowerCase().split(';')[0].trim();
 
   if (isHlsContentType(contentType, urlStr)) {
@@ -271,12 +269,14 @@ function isAllowedMediaContentType(contentType, urlStr) {
     lower.startsWith('audio/') ||
     lower === 'application/mp4' ||
     lower === 'application/octet-stream' ||
-    lower === 'binary/octet-stream'
+    lower === 'binary/octet-stream' ||
+    lower === 'application/pgp-keys'
   ) {
     return true;
   }
 
-  if (!lower && VIDEO_FILE_EXT_RE.test(urlStr)) {
+  // Allow 16-byte HLS AES-128 encryption keys or raw segments served as text/plain or empty type
+  if ((lower === '' || lower === 'text/plain') && (VIDEO_FILE_EXT_RE.test(urlStr) || contentLengthHeader === '16')) {
     return true;
   }
 
@@ -321,6 +321,7 @@ function buildProxyLink(targetUrl, refererOrigin) {
 
 function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
   const lines = manifestText.split(/\r?\n/);
+  const baseParsed = new URL(baseUrl);
 
   const resolveAndWrap = (uri) => {
     const trimmed = uri.trim();
@@ -329,6 +330,11 @@ function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
       const abs = new URL(trimmed, baseUrl);
       if (abs.protocol !== 'http:' && abs.protocol !== 'https:') {
         return trimmed;
+      }
+      // Preserve parent manifest query-string auth tokens (e.g. Bunny bcdn_token / expires / token_path)
+      // onto same-origin child playlists & segments that omit their own query string
+      if (baseParsed.search && !abs.search && abs.origin === baseParsed.origin) {
+        abs.search = baseParsed.search;
       }
       return buildProxyLink(abs.href, refererOrigin);
     } catch {
@@ -431,14 +437,15 @@ export async function handleVideoProxy(req, res) {
 
     if (!response.ok && response.status !== 206) {
       await response.body?.cancel().catch(() => {});
-      sendJson(res, response.status === 404 ? 404 : 502, {
-        error: `Remote media server returned HTTP ${response.status}.`,
+      sendJson(res, response.status === 404 ? 404 : response.status === 403 ? 403 : 502, {
+        error: `Remote media server returned HTTP ${response.status} for ${new URL(finalUrl).hostname}.`,
       });
       return;
     }
 
     const upstreamContentType = response.headers.get('content-type') ?? '';
-    if (!isAllowedMediaContentType(upstreamContentType, finalUrl)) {
+    const upstreamContentLength = response.headers.get('content-length') ?? '';
+    if (!isAllowedMediaContentType(upstreamContentType, finalUrl, upstreamContentLength)) {
       await response.body?.cancel().catch(() => {});
       sendJson(res, 415, {
         error: `Remote URL returned "${upstreamContentType || 'unknown'}" instead of a direct playable video stream.`,
@@ -622,8 +629,10 @@ export async function handleResolveVideo(req, res) {
   }
 
   try {
+    const initialParsed = await assertSafePublicUrl(targetUrl);
     const { response, finalUrl } = await safeFetchFollowingRedirects(targetUrl, {
       method: 'GET',
+      refererOrigin: `${initialParsed.origin}/`,
       acceptHeader:
         'text/html, application/xhtml+xml, video/*, application/vnd.apple.mpegurl, */*;q=0.8',
     });
@@ -638,8 +647,9 @@ export async function handleResolveVideo(req, res) {
     }
 
     const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+    const contentLength = response.headers.get('content-length') ?? '';
 
-    if (isAllowedMediaContentType(contentType, finalUrl)) {
+    if (isAllowedMediaContentType(contentType, finalUrl, contentLength)) {
       const hls = isHlsContentType(contentType, finalUrl);
       await response.body?.cancel().catch(() => {});
       sendJson(res, 200, {

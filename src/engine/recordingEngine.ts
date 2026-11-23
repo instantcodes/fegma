@@ -1073,8 +1073,21 @@ export class VideoRecordingEngine {
           this.destroyHlsInstance();
           this.snapshot.video.isLoaded = false;
           this.snapshot.video.loadProgress = 0;
+
+          let detailMsg = '';
+          const statusCode = data.response?.code;
+          if (typeof data.response?.text === 'string' && data.response.text.trim().startsWith('{')) {
+            try {
+              const parsedErr = JSON.parse(data.response.text) as { error?: string };
+              if (parsedErr.error) detailMsg = parsedErr.error;
+            } catch {
+              // Ignore non-JSON error body
+            }
+          }
+
           this.snapshot.video.errorMessage =
-            'Unable to fetch HLS video segments from the remote server. The stream token may have expired or access may be restricted.';
+            detailMsg ||
+            `Unable to fetch HLS stream (${data.details}${statusCode ? `, HTTP ${statusCode}` : ''}). The remote CDN may require a fresh token, domain-locked embed, or IP-bound session.`;
           this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
           this.snapshot.recording.statusMessage = 'HLS stream failed to load.';
           this.emit();
