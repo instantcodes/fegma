@@ -257,6 +257,17 @@ function isHlsContentType(contentType, urlStr) {
   return false;
 }
 
+function isDrmProtectedManifest(manifestText) {
+  const lower = manifestText.toLowerCase();
+  return (
+    /\.drm(\?|#|\s|$)/i.test(manifestText) ||
+    lower.includes('com.widevine') ||
+    lower.includes('com.apple.streamingkeydelivery') ||
+    lower.includes('com.microsoft.playready') ||
+    lower.includes('method=sample-aes')
+  );
+}
+
 function isAllowedMediaContentType(contentType, urlStr, contentLengthHeader) {
   const lower = contentType.toLowerCase().split(';')[0].trim();
 
@@ -471,6 +482,14 @@ export async function handleVideoProxy(req, res) {
         return;
       }
 
+      if (isDrmProtectedManifest(rawManifest)) {
+        sendJson(res, 403, {
+          error:
+            'This stream uses DRM protection (such as MediaCage, Widevine, or FairPlay) which browsers cannot capture via HTML5 captureStream().',
+        });
+        return;
+      }
+
       const rewritten = rewriteHlsManifest(rawManifest, finalUrl, refererOrigin);
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -667,6 +686,8 @@ export async function handleResolveVideo(req, res) {
       const embedOrigin = `${new URL(finalUrl).origin}/`;
       const candidates = extractDirectVideoCandidatesFromHtml(html, finalUrl);
 
+      let foundDrmStream = false;
+
       for (const candidate of candidates.slice(0, 8)) {
         try {
           const isCandidateHls = HLS_EXT_RE.test(candidate);
@@ -679,10 +700,15 @@ export async function handleResolveVideo(req, res) {
           });
 
           const probeType = (probe.response.headers.get('content-type') ?? '').toLowerCase();
+          const probeLength = probe.response.headers.get('content-length') ?? '';
           if (probe.response.ok || probe.response.status === 206) {
             if (isHlsContentType(probeType, probe.finalUrl)) {
-              const snippet = await readLimitedText(probe.response, 4096);
+              const snippet = await readLimitedText(probe.response, 8192);
               if (snippet.trimStart().startsWith('#EXTM3U')) {
+                if (isDrmProtectedManifest(snippet)) {
+                  foundDrmStream = true;
+                  continue;
+                }
                 sendJson(res, 200, {
                   ok: true,
                   kind: 'extracted',
@@ -693,7 +719,7 @@ export async function handleResolveVideo(req, res) {
                 });
                 return;
               }
-            } else if (isAllowedMediaContentType(probeType, probe.finalUrl)) {
+            } else if (isAllowedMediaContentType(probeType, probe.finalUrl, probeLength)) {
               await probe.response.body?.cancel().catch(() => {});
               sendJson(res, 200, {
                 ok: true,
@@ -714,8 +740,9 @@ export async function handleResolveVideo(req, res) {
 
       sendJson(res, 200, {
         ok: false,
-        error:
-          'This webpage did not expose an accessible HTML5 video or HLS stream (it may require an expired token, domain-locked referrer, or DRM decryption). Provide a direct .mp4/.webm/.m3u8 link or a valid embed link.',
+        error: foundDrmStream
+          ? 'This embed link uses DRM-protected streaming (MediaCage / Widevine / FairPlay), which cannot be captured via HTML5 captureStream(). Use an unprotected direct .mp4/.webm/.m3u8 video URL or a local file.'
+          : 'This webpage did not expose an accessible HTML5 video or HLS stream (it may require an expired token, domain-locked referrer, or DRM decryption). Provide a direct .mp4/.webm/.m3u8 link or a valid unprotected embed link.',
       });
       return;
     }

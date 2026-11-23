@@ -1037,7 +1037,11 @@ export class VideoRecordingEngine {
     this.emit();
   };
 
-  private attachHlsStream(manifestProxyUrl: string, seqId: number): void {
+  private attachHlsStream(
+    manifestUrl: string,
+    seqId: number,
+    directFallbackUrl?: string
+  ): void {
     if (!this.video) return;
     this.destroyHlsInstance();
 
@@ -1070,9 +1074,6 @@ export class VideoRecordingEngine {
             hls.startLoad();
             return;
           }
-          this.destroyHlsInstance();
-          this.snapshot.video.isLoaded = false;
-          this.snapshot.video.loadProgress = 0;
 
           let detailMsg = '';
           const statusCode = data.response?.code;
@@ -1085,9 +1086,24 @@ export class VideoRecordingEngine {
             }
           }
 
+          // If the proxy hit an IP/datacenter 403 (and not explicit DRM), try direct browser CORS once
+          const isDrmError = detailMsg.toLowerCase().includes('drm');
+          if (directFallbackUrl && statusCode === 403 && !isDrmError) {
+            this.snapshot.video.viaProxy = false;
+            this.snapshot.recording.statusMessage =
+              'Proxy blocked by remote CDN — retrying direct browser HLS connection…';
+            this.emit();
+            this.attachHlsStream(directFallbackUrl, seqId, undefined);
+            return;
+          }
+
+          this.destroyHlsInstance();
+          this.snapshot.video.isLoaded = false;
+          this.snapshot.video.loadProgress = 0;
+
           this.snapshot.video.errorMessage =
             detailMsg ||
-            `Unable to fetch HLS stream (${data.details}${statusCode ? `, HTTP ${statusCode}` : ''}). The remote CDN may require a fresh token, domain-locked embed, or IP-bound session.`;
+            `Unable to fetch HLS stream (${data.details}${statusCode ? `, HTTP ${statusCode}` : ''}). The remote CDN may require a fresh token, domain-locked embed, or DRM decryption.`;
           this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
           this.snapshot.recording.statusMessage = 'HLS stream failed to load.';
           this.emit();
@@ -1105,14 +1121,14 @@ export class VideoRecordingEngine {
         }
       });
 
-      hls.loadSource(manifestProxyUrl);
+      hls.loadSource(manifestUrl);
       hls.attachMedia(this.video);
       return;
     }
 
     // Native Safari HLS support
     if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
-      this.video.src = manifestProxyUrl;
+      this.video.src = manifestUrl;
       this.video.load();
       return;
     }
@@ -1163,7 +1179,7 @@ export class VideoRecordingEngine {
     this.emit();
 
     if (isHls) {
-      this.attachHlsStream(proxyUrl, seqId);
+      this.attachHlsStream(proxyUrl, seqId, resolved.resolvedUrl);
     } else {
       this.video.src = proxyUrl;
       this.video.load();
