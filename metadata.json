@@ -1,0 +1,6 @@
+{
+  "name": "SignalDeck",
+  "description": "Browser-based HTML5 video stream recorder and downloader using captureStream() and MediaRecorder with network-resilient auto-pause/resume.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
