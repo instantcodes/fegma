@@ -281,6 +281,8 @@ function isAllowedMediaContentType(contentType, urlStr, contentLengthHeader) {
     lower === 'application/mp4' ||
     lower === 'application/octet-stream' ||
     lower === 'binary/octet-stream' ||
+    lower === 'application/binary' ||
+    lower === 'application/x-binary' ||
     lower === 'application/pgp-keys'
   ) {
     return true;
@@ -322,10 +324,13 @@ function getQueryParam(req, key) {
   return parsed.searchParams.get(key)?.trim() ?? '';
 }
 
-function buildProxyLink(targetUrl, refererOrigin) {
+function buildProxyLink(targetUrl, refererOrigin, kind) {
   const params = new URLSearchParams({ url: targetUrl });
   if (refererOrigin) {
     params.set('referer', refererOrigin);
+  }
+  if (kind === 'key') {
+    params.set('kind', 'key');
   }
   return `/api/video-proxy?${params.toString()}`;
 }
@@ -334,7 +339,7 @@ function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
   const lines = manifestText.split(/\r?\n/);
   const baseParsed = new URL(baseUrl);
 
-  const resolveAndWrap = (uri) => {
+  const resolveAndWrap = (uri, kind) => {
     const trimmed = uri.trim();
     if (!trimmed) return trimmed;
     try {
@@ -347,7 +352,7 @@ function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
       if (baseParsed.search && !abs.search && abs.origin === baseParsed.origin) {
         abs.search = baseParsed.search;
       }
-      return buildProxyLink(abs.href, refererOrigin);
+      return buildProxyLink(abs.href, refererOrigin, kind);
     } catch {
       return trimmed;
     }
@@ -360,14 +365,15 @@ function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
 
       if (trimmed.startsWith('#')) {
         if (trimmed.includes('URI="')) {
+          const isKeyTag = trimmed.startsWith('#EXT-X-KEY');
           return line.replace(/URI="([^"]+)"/g, (_m, uriValue) => {
-            return `URI="${resolveAndWrap(uriValue)}"`;
+            return `URI="${resolveAndWrap(uriValue, isKeyTag ? 'key' : undefined)}"`;
           });
         }
         return line;
       }
 
-      return resolveAndWrap(trimmed);
+      return resolveAndWrap(trimmed, undefined);
     })
     .join('\n');
 }
@@ -421,18 +427,22 @@ export async function handleVideoProxy(req, res) {
   }
 
   const refererOrigin = await sanitizeRefererOrigin(getQueryParam(req, 'referer') || undefined);
+  const requestKind = getQueryParam(req, 'kind');
+  const isKeyRequest = requestKind === 'key';
   const incomingRange = typeof req.headers.range === 'string' ? req.headers.range : undefined;
-  const likelyManifest = HLS_EXT_RE.test(targetUrl);
-  const normalizedRange = normalizeProxyRange(incomingRange, method, likelyManifest);
+  const likelyManifest = !isKeyRequest && HLS_EXT_RE.test(targetUrl);
+  const normalizedRange = normalizeProxyRange(incomingRange, method, likelyManifest || isKeyRequest);
 
   try {
     let { response, finalUrl } = await safeFetchFollowingRedirects(targetUrl, {
       method,
       rangeHeader: normalizedRange,
       refererOrigin,
-      acceptHeader: likelyManifest
-        ? 'application/vnd.apple.mpegurl, application/x-mpegurl, text/plain, */*;q=0.5'
-        : 'video/*, audio/*, application/octet-stream;q=0.9, */*;q=0.5',
+      acceptHeader: isKeyRequest
+        ? 'application/octet-stream, */*;q=0.5'
+        : likelyManifest
+          ? 'application/vnd.apple.mpegurl, application/x-mpegurl, text/plain, */*;q=0.5'
+          : 'video/*, audio/*, application/octet-stream;q=0.9, */*;q=0.5',
     });
 
     if ((response.status === 416 || response.status === 400) && !incomingRange && method === 'GET') {
@@ -449,13 +459,50 @@ export async function handleVideoProxy(req, res) {
     if (!response.ok && response.status !== 206) {
       await response.body?.cancel().catch(() => {});
       sendJson(res, response.status === 404 ? 404 : response.status === 403 ? 403 : 502, {
-        error: `Remote media server returned HTTP ${response.status} for ${new URL(finalUrl).hostname}.`,
+        error: isKeyRequest
+          ? `Remote encryption key server returned HTTP ${response.status} (${new URL(finalUrl).hostname}). This stream restricts decryption keys to its official embedded player.`
+          : `Remote media server returned HTTP ${response.status} for ${new URL(finalUrl).hostname}.`,
       });
       return;
     }
 
     const upstreamContentType = response.headers.get('content-type') ?? '';
     const upstreamContentLength = response.headers.get('content-length') ?? '';
+
+    // Standard HLS AES-128 keys are strictly 16 raw bytes; read with a tiny byte cap to avoid unbounded buffering
+    if (isKeyRequest && method === 'GET') {
+      const reader = response.body?.getReader();
+      const chunks = [];
+      let total = 0;
+      if (reader) {
+        try {
+          while (total <= 32) {
+            const { done, value } = await reader.read();
+            if (done || !value) break;
+            chunks.push(value);
+            total += value.byteLength;
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+      }
+      if (total !== 16) {
+        sendJson(res, 403, {
+          error:
+            'The remote encryption key endpoint did not return a valid 16-byte AES-128 key (this stream likely uses DRM or proprietary player authentication).',
+        });
+        return;
+      }
+      const keyBuf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', '16');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.end(keyBuf);
+      return;
+    }
+
     if (!isAllowedMediaContentType(upstreamContentType, finalUrl, upstreamContentLength)) {
       await response.body?.cancel().catch(() => {});
       sendJson(res, 415, {

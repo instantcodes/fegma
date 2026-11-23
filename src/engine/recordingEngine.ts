@@ -1086,9 +1086,10 @@ export class VideoRecordingEngine {
             }
           }
 
-          // If the proxy hit an IP/datacenter 403 (and not explicit DRM), try direct browser CORS once
+          // If the proxy hit an IP/datacenter 403 on manifest/level (not DRM or keyLoadError), try direct browser CORS once
           const isDrmError = detailMsg.toLowerCase().includes('drm');
-          if (directFallbackUrl && statusCode === 403 && !isDrmError) {
+          const isKeyError = data.details === 'keyLoadError' || data.details === 'keyLoadTimeOut';
+          if (directFallbackUrl && statusCode === 403 && !isDrmError && !isKeyError) {
             this.snapshot.video.viaProxy = false;
             this.snapshot.recording.statusMessage =
               'Proxy blocked by remote CDN — retrying direct browser HLS connection…';
@@ -1103,7 +1104,9 @@ export class VideoRecordingEngine {
 
           this.snapshot.video.errorMessage =
             detailMsg ||
-            `Unable to fetch HLS stream (${data.details}${statusCode ? `, HTTP ${statusCode}` : ''}). The remote CDN may require a fresh token, domain-locked embed, or DRM decryption.`;
+            (isKeyError
+              ? 'This video stream uses encrypted HLS keys restricted by the remote streaming host (such as Bunny MediaCage DRM or token-gated playback). Protected streams cannot be decrypted or captured outside their official player—use an unprotected direct .mp4/.webm/.m3u8 URL or a local file.'
+              : `Unable to fetch HLS stream (${data.details}${statusCode ? `, HTTP ${statusCode}` : ''}). The remote CDN may require a fresh token, domain-locked embed, or DRM decryption.`);
           this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
           this.snapshot.recording.statusMessage = 'HLS stream failed to load.';
           this.emit();
