@@ -49,7 +49,13 @@ export function VideoMonitor({
               : '— × —'}
           </span>
           <span aria-hidden="true">·</span>
-          <span>Cursor Excluded</span>
+          <span>{videoState.viaProxy ? 'Proxy Stream' : 'Cursor Excluded'}</span>
+          {videoState.viaProxy && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span>Cursor Excluded</span>
+            </>
+          )}
           {videoState.isLoaded && (
             <>
               <span aria-hidden="true">·</span>

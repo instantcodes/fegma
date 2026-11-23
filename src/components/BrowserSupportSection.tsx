@@ -91,13 +91,15 @@ export function BrowserSupportSection({ capabilities }: BrowserSupportSectionPro
               <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#2563EB] dark:text-[#60A5FA]" aria-hidden="true" />
               <span>
                 <strong className="font-semibold text-[#111318] dark:text-[#ECEEF4]">
-                  CORS Headers Required for Remote URLs:
+                  Automatic Same-Origin Proxy for Non-CORS Servers:
                 </strong>{' '}
-                Direct remote URLs (.mp4, .webm) must return{' '}
+                SignalDeck tries direct loading first. If a remote video server omits{' '}
                 <code className="font-mono text-[11px] text-[#111318] dark:text-[#CBD1E0]">
                   Access-Control-Allow-Origin
                 </code>{' '}
-                so the browser allows <code className="font-mono text-[11px]">captureStream()</code>.
+                headers or links to a public page with an embedded HTML5 video, SignalDeck
+                automatically streams it through its same-origin proxy so{' '}
+                <code className="font-mono text-[11px]">captureStream()</code> works cleanly.
               </span>
             </li>
             <li className="flex items-start gap-2.5">

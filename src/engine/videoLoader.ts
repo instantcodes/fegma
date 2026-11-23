@@ -16,19 +16,19 @@ export const SAMPLE_VIDEO_CLIPS: SampleVideoItem[] = [
     type: 'synthetic',
   },
   {
-    id: 'gcs-blazes',
-    title: 'For Bigger Blazes (Direct MP4)',
-    description: 'CORS-enabled 720p MP4 clip with stereo audio',
-    durationHint: '00:15',
-    url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    id: 'mdn-flower-mp4',
+    title: 'Blooming Flower (Direct MP4)',
+    description: 'Public CC0 MP4 clip (automatically proxied if server omits CORS)',
+    durationHint: '00:05',
+    url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
     type: 'sample',
   },
   {
-    id: 'gcs-joyrides',
-    title: 'For Bigger Joyrides (Direct MP4)',
-    description: 'CORS-enabled 720p MP4 clip for testing pause/resume',
-    durationHint: '00:15',
-    url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4',
+    id: 'mdn-flower-webm',
+    title: 'Blooming Flower (Direct WebM)',
+    description: 'Public CC0 WebM clip for testing WebM capture & pause/resume',
+    durationHint: '00:05',
+    url: 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm',
     type: 'sample',
   },
 ];
@@ -73,13 +73,13 @@ export function validateVideoUrl(rawUrl: string): UrlValidationResult {
   }
 
   const host = parsed.hostname.toLowerCase();
-  const blockedEmbedHosts = ['youtube.com', 'youtu.be', 'vimeo.com', 'netflix.com', 'twitch.tv', 'dailymotion.com'];
-  if (blockedEmbedHosts.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
+  const drmOnlyHosts = ['netflix.com', 'disneyplus.com', 'hulu.com', 'max.com', 'primevideo.com'];
+  if (drmOnlyHosts.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
     return {
       valid: false,
       normalizedUrl: '',
       error:
-        'Streaming platform pages (such as YouTube, Vimeo, or Netflix) use embedded players and DRM rather than direct video files. Provide a direct CORS-enabled media URL (.mp4 / .webm) or load a local video file.',
+        'Subscription DRM streaming platforms cannot be loaded into an HTML5 video element. Provide a direct video URL (.mp4 / .webm) or load a local video file.',
     };
   }
 
@@ -87,6 +87,48 @@ export function validateVideoUrl(rawUrl: string): UrlValidationResult {
     valid: true,
     normalizedUrl: parsed.href,
   };
+}
+
+/**
+ * Builds the same-origin streaming media proxy URL so remote videos without CORS headers
+ * can play inside HTML5 <video> and be captured via captureStream() cleanly.
+ */
+export function buildSameOriginProxyUrl(remoteUrl: string): string {
+  return `/api/video-proxy?url=${encodeURIComponent(remoteUrl)}`;
+}
+
+export interface VideoResolveResponse {
+  ok: boolean;
+  kind?: 'direct' | 'extracted';
+  resolvedUrl?: string;
+  contentType?: string;
+  error?: string;
+}
+
+/**
+ * Calls the same-origin resolver endpoint to verify a remote video URL or extract
+ * a direct HTML5 video source from an HTML page containing <video> / og:video tags.
+ */
+export async function resolveRemoteVideoUrl(remoteUrl: string): Promise<VideoResolveResponse> {
+  try {
+    const response = await fetch(`/api/resolve-video?url=${encodeURIComponent(remoteUrl)}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `Media resolver returned HTTP ${response.status}.`,
+      };
+    }
+    const data = (await response.json()) as VideoResolveResponse;
+    return data;
+  } catch {
+    return {
+      ok: false,
+      error: 'Could not reach the same-origin media proxy service.',
+    };
+  }
 }
 
 /**

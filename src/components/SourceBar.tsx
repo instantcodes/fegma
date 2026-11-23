@@ -71,7 +71,7 @@ export function SourceBar({
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             disabled={isRecordingActive || isGeneratingSample}
-            placeholder="Paste a direct CORS-enabled video URL (https://…/video.mp4 or .webm)"
+            placeholder="Paste a video URL (direct .mp4/.webm, non-CORS server, or HTML5 video page)"
             className="h-11 w-full rounded-md border border-[#D4D8E2] bg-[#F8F9FB] pr-4 pl-10 font-mono text-sm text-[#111318] placeholder-[#7B8296] transition-colors focus:border-[#2563EB] focus:bg-white focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:border-[#2A2F3E] dark:bg-[#0B0D13] dark:text-[#ECEEF4] dark:placeholder-[#656D82] dark:focus:border-[#3B82F6] dark:focus:bg-[#0D1018]"
           />
         </div>

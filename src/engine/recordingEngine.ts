@@ -17,7 +17,12 @@ import type {
   RecorderStatus,
   VideoSourceType,
 } from './types';
-import { classifyVideoLoadError, validateVideoUrl } from './videoLoader';
+import {
+  buildSameOriginProxyUrl,
+  classifyVideoLoadError,
+  resolveRemoteVideoUrl,
+  validateVideoUrl,
+} from './videoLoader';
 
 type SnapshotListener = (snapshot: EngineSnapshot) => void;
 
@@ -41,8 +46,10 @@ export class VideoRecordingEngine {
   private capabilities: BrowserCapabilities = detectBrowserCapabilities();
   private snapshot: EngineSnapshot;
 
-  // Source blob tracking (for local files / synthetic clip cleanup)
+  // Source blob & proxy fallback tracking
   private activeOwnedSourceBlobUrl: string | null = null;
+  private loadSequenceId = 0;
+  private hasTriedProxyFallback = false;
 
   // Accurate elapsed recording timer (excludes paused / buffering / offline intervals)
   private accumulatedElapsedMs = 0;
@@ -65,6 +72,7 @@ export class VideoRecordingEngine {
         sourceUrl: '',
         sourceLabel: '',
         sourceType: null,
+        viaProxy: false,
         isLoaded: false,
         isPlaying: false,
         isMuted: false,
@@ -230,6 +238,9 @@ export class VideoRecordingEngine {
       validation.normalizedUrl.startsWith('http://') ||
       validation.normalizedUrl.startsWith('https://');
 
+    this.loadSequenceId += 1;
+    this.hasTriedProxyFallback = false;
+
     this.video.pause();
     this.video.removeAttribute('src');
 
@@ -245,6 +256,7 @@ export class VideoRecordingEngine {
       sourceUrl: validation.normalizedUrl,
       sourceLabel: label || validation.normalizedUrl,
       sourceType,
+      viaProxy: false,
       isLoaded: false,
       isPlaying: false,
       loadProgress: 5,
@@ -997,9 +1009,71 @@ export class VideoRecordingEngine {
     this.emit();
   };
 
+  private async attemptSameOriginProxyFallback(remoteUrl: string, seqId: number): Promise<void> {
+    const resolved = await resolveRemoteVideoUrl(remoteUrl);
+    if (seqId !== this.loadSequenceId || !this.video) return;
+
+    if (!resolved.ok || !resolved.resolvedUrl) {
+      this.snapshot.video.isLoaded = false;
+      this.snapshot.video.isPlaying = false;
+      this.snapshot.video.loadProgress = 0;
+      this.snapshot.video.viaProxy = false;
+      this.snapshot.video.errorMessage =
+        resolved.error ||
+        'This URL could not be loaded as a playable HTML5 video stream, even via the same-origin proxy.';
+      this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
+      this.snapshot.recording.statusMessage = 'Video failed to load. Check source compatibility.';
+      this.emit();
+      return;
+    }
+
+    const proxyUrl = buildSameOriginProxyUrl(resolved.resolvedUrl);
+    this.video.pause();
+    this.video.removeAttribute('crossorigin');
+
+    this.snapshot.video = {
+      ...this.snapshot.video,
+      viaProxy: true,
+      isLoaded: false,
+      loadProgress: 25,
+      errorMessage: null,
+    };
+    this.snapshot.recording.status = 'loading';
+    this.snapshot.recording.statusMessage =
+      resolved.kind === 'extracted'
+        ? 'Direct video stream found on page — loading through same-origin proxy…'
+        : 'Remote server lacks CORS headers — streaming through same-origin proxy…';
+    this.emit();
+
+    this.video.src = proxyUrl;
+    this.video.load();
+  }
+
   private onVideoError = (): void => {
     if (!this.video) return;
-    const errMsg = classifyVideoLoadError(this.video, this.snapshot.video.sourceUrl);
+
+    const currentSource = this.snapshot.video.sourceUrl;
+    const isRemoteHttp =
+      currentSource.startsWith('http://') || currentSource.startsWith('https://');
+
+    // Automatically fall back to same-origin media proxy if a remote URL failed direct CORS load
+    if (
+      isRemoteHttp &&
+      !this.hasTriedProxyFallback &&
+      !this.snapshot.recording.isRecordingActive
+    ) {
+      this.hasTriedProxyFallback = true;
+      this.snapshot.video.errorMessage = null;
+      this.snapshot.video.loadProgress = 18;
+      this.snapshot.recording.status = 'loading';
+      this.snapshot.recording.statusMessage =
+        'Direct CORS load blocked — resolving via same-origin media proxy…';
+      this.emit();
+      void this.attemptSameOriginProxyFallback(currentSource, this.loadSequenceId);
+      return;
+    }
+
+    const errMsg = classifyVideoLoadError(this.video, currentSource);
     this.snapshot.video.isLoaded = false;
     this.snapshot.video.isPlaying = false;
     this.snapshot.video.loadProgress = 0;

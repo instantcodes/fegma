@@ -55,6 +55,7 @@ export interface VideoPlaybackState {
   sourceUrl: string;
   sourceLabel: string;
   sourceType: VideoSourceType | null;
+  viaProxy: boolean;
   isLoaded: boolean;
   isPlaying: boolean;
   isMuted: boolean;
