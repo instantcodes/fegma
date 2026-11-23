@@ -89,25 +89,49 @@ export function validateVideoUrl(rawUrl: string): UrlValidationResult {
   };
 }
 
+export function isLikelyHlsUrl(url: string): boolean {
+  return /\.m3u8(\?|#|$)/i.test(url);
+}
+
+export function isLikelyEmbedPageUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host.includes('mediadelivery.net') ||
+      parsed.pathname.toLowerCase().includes('/embed/') ||
+      parsed.pathname.toLowerCase().endsWith('.html')
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Builds the same-origin streaming media proxy URL so remote videos without CORS headers
- * can play inside HTML5 <video> and be captured via captureStream() cleanly.
+ * Builds the same-origin streaming media proxy URL so remote videos or HLS playlists
+ * without CORS headers can play inside HTML5 <video> and be captured via captureStream() cleanly.
  */
-export function buildSameOriginProxyUrl(remoteUrl: string): string {
-  return `/api/video-proxy?url=${encodeURIComponent(remoteUrl)}`;
+export function buildSameOriginProxyUrl(remoteUrl: string, refererOrigin?: string): string {
+  const params = new URLSearchParams({ url: remoteUrl });
+  if (refererOrigin) {
+    params.set('referer', refererOrigin);
+  }
+  return `/api/video-proxy?${params.toString()}`;
 }
 
 export interface VideoResolveResponse {
   ok: boolean;
   kind?: 'direct' | 'extracted';
+  streamFormat?: 'hls' | 'file';
   resolvedUrl?: string;
+  refererOrigin?: string;
   contentType?: string;
   error?: string;
 }
 
 /**
  * Calls the same-origin resolver endpoint to verify a remote video URL or extract
- * a direct HTML5 video source from an HTML page containing <video> / og:video tags.
+ * a direct HTML5/HLS video stream from an HTML embed page.
  */
 export async function resolveRemoteVideoUrl(remoteUrl: string): Promise<VideoResolveResponse> {
   try {
@@ -115,14 +139,20 @@ export async function resolveRemoteVideoUrl(remoteUrl: string): Promise<VideoRes
       method: 'GET',
       headers: { Accept: 'application/json' },
     });
+    const text = await response.text();
+    let parsed: VideoResolveResponse | null = null;
+    try {
+      parsed = JSON.parse(text) as VideoResolveResponse;
+    } catch {
+      parsed = null;
+    }
     if (!response.ok) {
       return {
         ok: false,
-        error: `Media resolver returned HTTP ${response.status}.`,
+        error: parsed?.error || `Media resolver returned HTTP ${response.status}.`,
       };
     }
-    const data = (await response.json()) as VideoResolveResponse;
-    return data;
+    return parsed ?? { ok: false, error: 'Media resolver returned an invalid response.' };
   } catch {
     return {
       ok: false,

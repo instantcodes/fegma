@@ -1,12 +1,11 @@
 import { lookup } from 'node:dns/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
-import { Readable } from 'node:stream';
 
 const MAX_REDIRECTS = 5;
 const UPSTREAM_TIMEOUT_MS = 20_000;
 const CHUNK_RANGE_SIZE = 3 * 1024 * 1024; // 3 MB bounded chunks for Vercel serverless compatibility
-const MAX_HTML_INSPECT_BYTES = 512 * 1024; // 512 KB cap for safe HTML video-tag inspection
+const MAX_HTML_INSPECT_BYTES = 512 * 1024; // 512 KB cap for safe HTML inspection
+const MAX_MANIFEST_BYTES = 1024 * 1024; // 1 MB cap for HLS .m3u8 manifest rewriting
 
 const ALLOWED_PORTS = new Set(['', '80', '443', '8080', '8443']);
 
@@ -21,46 +20,43 @@ const BLOCKED_HOSTNAMES = new Set([
   'instance-data',
 ]);
 
-const VIDEO_FILE_EXT_RE = /\.(mp4|webm|ogv|ogg|mov|m4v|m3u8)(\?|#|$)/i;
+const VIDEO_FILE_EXT_RE = /\.(mp4|webm|ogv|ogg|mov|m4v|m3u8|ts|m4s|m4a|aac)(\?|#|$)/i;
+const HLS_EXT_RE = /\.m3u8(\?|#|$)/i;
 const VALID_RANGE_RE = /^bytes=(\d+-\d*|-\d+)$/;
 
-function isPrivateOrReservedIPv4(ip: string): boolean {
+function isPrivateOrReservedIPv4(ip) {
   const parts = ip.split('.').map((part) => Number(part));
   if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     return true;
   }
-  const [a, b] = parts;
+  const [a, b, c] = parts;
 
-  if (a === 0) return true; // 0.0.0.0/8 unspecified
-  if (a === 10) return true; // 10.0.0.0/8 RFC1918
-  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-  if (a === 127) return true; // 127.0.0.0/8 loopback
-  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
-  if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
-  if (a === 192 && b === 0 && (parts[2] === 0 || parts[2] === 2)) return true; // IETF / TEST-NET-1
-  if (a === 198 && (b === 18 || b === 19)) return true; // Benchmark
-  if (a >= 224) return true; // Multicast & reserved
+  if (a === 0) return true;
+  if (a === 10) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a >= 224) return true;
 
   return false;
 }
 
-function isPrivateOrReservedIPv6(ip: string): boolean {
+function isPrivateOrReservedIPv6(ip) {
   const normalized = ip.toLowerCase().replace(/^\[|\]$/g, '');
   if (normalized === '::' || normalized === '::1') return true;
 
-  // Handle IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
   const v4MappedMatch = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (v4MappedMatch) {
     return isPrivateOrReservedIPv4(v4MappedMatch[1]);
   }
-
-  // Handle hex IPv4-mapped form ::ffff:7f00:1
   if (normalized.startsWith('::ffff:')) {
     return true;
   }
 
-  // Unique local fc00::/7, link-local fe80::/10, multicast ff00::/8, NAT64 64:ff9b::, 6to4 2002::, doc 2001:db8::
   if (
     normalized.startsWith('fc') ||
     normalized.startsWith('fd') ||
@@ -79,7 +75,7 @@ function isPrivateOrReservedIPv6(ip: string): boolean {
   return false;
 }
 
-function isPublicIpAddress(ip: string): boolean {
+function isPublicIpAddress(ip) {
   const family = isIP(ip);
   if (family === 4) return !isPrivateOrReservedIPv4(ip);
   if (family === 6) return !isPrivateOrReservedIPv6(ip);
@@ -89,9 +85,11 @@ function isPublicIpAddress(ip: string): boolean {
 /**
  * Validates that a target URL uses http/https on an allowed port, has no embedded credentials,
  * is not a local/internal host, and resolves exclusively to public routable IP addresses.
+ * @param {string} rawUrl
+ * @returns {Promise<URL>}
  */
-export async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
-  let parsed: URL;
+export async function assertSafePublicUrl(rawUrl) {
+  let parsed;
   try {
     parsed = new URL(rawUrl);
   } catch {
@@ -121,7 +119,6 @@ export async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
     throw new Error('Access to local or internal network addresses is not permitted.');
   }
 
-  // Direct IP literal check
   if (isIP(hostname) !== 0) {
     if (!isPublicIpAddress(hostname)) {
       throw new Error('Access to private or reserved IP ranges is not permitted.');
@@ -129,8 +126,7 @@ export async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
     return parsed;
   }
 
-  // Resolve DNS and confirm every returned IP is globally routable
-  let records: Array<{ address: string; family: number }>;
+  let records;
   try {
     records = await lookup(hostname, { all: true });
   } catch {
@@ -150,19 +146,22 @@ export async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
   return parsed;
 }
 
-async function safeFetchFollowingRedirects(
-  initialUrl: string,
-  init: {
-    method: 'GET' | 'HEAD';
-    rangeHeader?: string;
-    acceptHeader?: string;
+async function sanitizeRefererOrigin(rawReferer) {
+  if (!rawReferer) return undefined;
+  try {
+    const validated = await assertSafePublicUrl(rawReferer);
+    return `${validated.origin}/`;
+  } catch {
+    return undefined;
   }
-): Promise<{ response: Response; finalUrl: string }> {
+}
+
+async function safeFetchFollowingRedirects(initialUrl, init) {
   let currentUrl = initialUrl;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const validatedUrl = await assertSafePublicUrl(currentUrl);
-    const headers: Record<string, string> = {
+    const headers = {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       Accept: init.acceptHeader ?? '*/*',
@@ -172,10 +171,15 @@ async function safeFetchFollowingRedirects(
       headers.Range = init.rangeHeader;
     }
 
+    if (init.refererOrigin) {
+      headers.Referer = init.refererOrigin;
+      headers.Origin = init.refererOrigin.replace(/\/$/, '');
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
-    let response: Response;
+    let response;
     try {
       response = await fetch(validatedUrl.href, {
         method: init.method,
@@ -187,13 +191,11 @@ async function safeFetchFollowingRedirects(
       clearTimeout(timer);
     }
 
-    // Manually validate and follow 3xx redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) {
         return { response, finalUrl: validatedUrl.href };
       }
-      // Cancel redirect body before next hop
       await response.body?.cancel().catch(() => {});
       currentUrl = new URL(location, validatedUrl.href).href;
       continue;
@@ -205,11 +207,10 @@ async function safeFetchFollowingRedirects(
   throw new Error('Too many redirects while reaching the video source.');
 }
 
-function normalizeProxyRange(rawRange: string | undefined, method: 'GET' | 'HEAD'): string | undefined {
-  if (method === 'HEAD') return undefined;
+function normalizeProxyRange(rawRange, method, isManifestRequest) {
+  if (method === 'HEAD' || isManifestRequest) return undefined;
 
   if (!rawRange) {
-    // Request a bounded first chunk so upstream returns 206 Partial Content with full total size
     return `bytes=0-${CHUNK_RANGE_SIZE - 1}`;
   }
 
@@ -218,7 +219,6 @@ function normalizeProxyRange(rawRange: string | undefined, method: 'GET' | 'HEAD
     return `bytes=0-${CHUNK_RANGE_SIZE - 1}`;
   }
 
-  // Cap open-ended ranges (bytes=START-) to 3 MB so serverless streaming stays within body limits
   const openMatch = trimmed.match(/^bytes=(\d+)-$/);
   if (openMatch) {
     const start = Number(openMatch[1]);
@@ -227,7 +227,6 @@ function normalizeProxyRange(rawRange: string | undefined, method: 'GET' | 'HEAD
     }
   }
 
-  // Also cap overly wide explicit ranges (bytes=START-END) to 3 MB
   const boundedMatch = trimmed.match(/^bytes=(\d+)-(\d+)$/);
   if (boundedMatch) {
     const start = Number(boundedMatch[1]);
@@ -241,25 +240,42 @@ function normalizeProxyRange(rawRange: string | undefined, method: 'GET' | 'HEAD
   return trimmed;
 }
 
-function isAllowedMediaContentType(contentType: string, urlStr: string): boolean {
+function isHlsContentType(contentType, urlStr) {
   const lower = contentType.toLowerCase().split(';')[0].trim();
+  if (
+    lower === 'application/vnd.apple.mpegurl' ||
+    lower === 'application/x-mpegurl' ||
+    lower === 'audio/mpegurl' ||
+    lower === 'audio/x-mpegurl'
+  ) {
+    return true;
+  }
+  if (
+    HLS_EXT_RE.test(urlStr) &&
+    (lower === '' || lower === 'text/plain' || lower === 'application/octet-stream')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isAllowedMediaContentType(contentType, urlStr) {
+  const lower = contentType.toLowerCase().split(';')[0].trim();
+
+  if (isHlsContentType(contentType, urlStr)) {
+    return true;
+  }
 
   if (
     lower.startsWith('video/') ||
     lower.startsWith('audio/') ||
     lower === 'application/mp4' ||
-    lower === 'application/vnd.apple.mpegurl' ||
-    lower === 'application/x-mpegurl'
+    lower === 'application/octet-stream' ||
+    lower === 'binary/octet-stream'
   ) {
     return true;
   }
 
-  // Many CDNs serve .mp4/.webm files as application/octet-stream
-  if (lower === 'application/octet-stream' || lower === 'binary/octet-stream') {
-    return true;
-  }
-
-  // Allow empty content-type only when URL ends with a known video file extension
   if (!lower && VIDEO_FILE_EXT_RE.test(urlStr)) {
     return true;
   }
@@ -267,16 +283,18 @@ function isAllowedMediaContentType(contentType: string, urlStr: string): boolean
   return false;
 }
 
-function inferMimeFromUrl(urlStr: string): string {
+function inferMimeFromUrl(urlStr) {
   const lower = urlStr.toLowerCase();
+  if (lower.includes('.m3u8')) return 'application/vnd.apple.mpegurl';
   if (lower.includes('.webm')) return 'video/webm';
   if (lower.includes('.ogv') || lower.includes('.ogg')) return 'video/ogg';
   if (lower.includes('.mov')) return 'video/quicktime';
-  if (lower.includes('.m3u8')) return 'application/vnd.apple.mpegurl';
+  if (lower.includes('.ts')) return 'video/mp2t';
+  if (lower.includes('.m4s')) return 'video/iso.segment';
   return 'video/mp4';
 }
 
-function sendJson(res: ServerResponse, status: number, payload: Record<string, unknown>): void {
+function sendJson(res, status, payload) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -284,17 +302,95 @@ function sendJson(res: ServerResponse, status: number, payload: Record<string, u
   res.end(JSON.stringify(payload));
 }
 
-function getQueryParam(req: IncomingMessage, key: string): string {
-  const raw = req.url ?? '/';
+function getQueryParam(req, key) {
+  if (req && req.query && typeof req.query[key] === 'string') {
+    return req.query[key].trim();
+  }
+  const raw = req?.url ?? '/';
   const parsed = new URL(raw, 'http://localhost');
   return parsed.searchParams.get(key)?.trim() ?? '';
 }
 
+function buildProxyLink(targetUrl, refererOrigin) {
+  const params = new URLSearchParams({ url: targetUrl });
+  if (refererOrigin) {
+    params.set('referer', refererOrigin);
+  }
+  return `/api/video-proxy?${params.toString()}`;
+}
+
+function rewriteHlsManifest(manifestText, baseUrl, refererOrigin) {
+  const lines = manifestText.split(/\r?\n/);
+
+  const resolveAndWrap = (uri) => {
+    const trimmed = uri.trim();
+    if (!trimmed) return trimmed;
+    try {
+      const abs = new URL(trimmed, baseUrl);
+      if (abs.protocol !== 'http:' && abs.protocol !== 'https:') {
+        return trimmed;
+      }
+      return buildProxyLink(abs.href, refererOrigin);
+    } catch {
+      return trimmed;
+    }
+  };
+
+  return lines
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+
+      if (trimmed.startsWith('#')) {
+        if (trimmed.includes('URI="')) {
+          return line.replace(/URI="([^"]+)"/g, (_m, uriValue) => {
+            return `URI="${resolveAndWrap(uriValue)}"`;
+          });
+        }
+        return line;
+      }
+
+      return resolveAndWrap(trimmed);
+    })
+    .join('\n');
+}
+
+async function readLimitedText(response, maxBytes) {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      const slice =
+        total + value.byteLength > maxBytes ? value.subarray(0, maxBytes - total) : value;
+      chunks.push(slice);
+      total += slice.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(combined);
+}
+
 /**
- * Streams a validated remote direct video URL as a same-origin response with Range support,
- * enabling HTML5 playback and captureStream() even when upstream servers omit CORS headers.
+ * Streams a validated remote video file or rewritten HLS .m3u8 playlist/segments
+ * as a same-origin response so HTML5 <video> and captureStream() work without CORS errors.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @returns {Promise<void>}
  */
-export async function handleVideoProxy(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleVideoProxy(req, res) {
   const method = req.method === 'HEAD' ? 'HEAD' : req.method === 'GET' ? 'GET' : null;
   if (!method) {
     sendJson(res, 405, { error: 'Only GET and HEAD requests are supported.' });
@@ -307,21 +403,26 @@ export async function handleVideoProxy(req: IncomingMessage, res: ServerResponse
     return;
   }
 
+  const refererOrigin = await sanitizeRefererOrigin(getQueryParam(req, 'referer') || undefined);
   const incomingRange = typeof req.headers.range === 'string' ? req.headers.range : undefined;
-  const normalizedRange = normalizeProxyRange(incomingRange, method);
+  const likelyManifest = HLS_EXT_RE.test(targetUrl);
+  const normalizedRange = normalizeProxyRange(incomingRange, method, likelyManifest);
 
   try {
     let { response, finalUrl } = await safeFetchFollowingRedirects(targetUrl, {
       method,
       rangeHeader: normalizedRange,
-      acceptHeader: 'video/*, audio/*, application/octet-stream;q=0.9, */*;q=0.5',
+      refererOrigin,
+      acceptHeader: likelyManifest
+        ? 'application/vnd.apple.mpegurl, application/x-mpegurl, text/plain, */*;q=0.5'
+        : 'video/*, audio/*, application/octet-stream;q=0.9, */*;q=0.5',
     });
 
-    // Some servers return 416 or reject Range headers; retry once without Range if client didn't ask for one
     if ((response.status === 416 || response.status === 400) && !incomingRange && method === 'GET') {
       await response.body?.cancel().catch(() => {});
       const retry = await safeFetchFollowingRedirects(targetUrl, {
         method: 'GET',
+        refererOrigin,
         acceptHeader: 'video/*, audio/*, application/octet-stream;q=0.9, */*;q=0.5',
       });
       response = retry.response;
@@ -342,6 +443,33 @@ export async function handleVideoProxy(req: IncomingMessage, res: ServerResponse
       sendJson(res, 415, {
         error: `Remote URL returned "${upstreamContentType || 'unknown'}" instead of a direct playable video stream.`,
       });
+      return;
+    }
+
+    if (isHlsContentType(upstreamContentType, finalUrl)) {
+      if (method === 'HEAD') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.end();
+        return;
+      }
+
+      const rawManifest = await readLimitedText(response, MAX_MANIFEST_BYTES);
+      if (!rawManifest.trimStart().startsWith('#EXTM3U')) {
+        sendJson(res, 415, {
+          error: 'Remote playlist response was not a valid HLS (#EXTM3U) manifest.',
+        });
+        return;
+      }
+
+      const rewritten = rewriteHlsManifest(rawManifest, finalUrl, refererOrigin);
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.end(rewritten);
       return;
     }
 
@@ -374,25 +502,34 @@ export async function handleVideoProxy(req: IncomingMessage, res: ServerResponse
       return;
     }
 
-    // Stream upstream chunks directly to the HTTP response
-    const nodeStream = Readable.fromWeb(
-      response.body as unknown as import('node:stream/web').ReadableStream
-    );
-
-    const onClientClose = () => {
-      nodeStream.destroy();
+    // Stream chunks directly using standard Web ReadableStream reader (universal across Node 18-24 & Vercel)
+    const reader = response.body.getReader();
+    let aborted = false;
+    const onClose = () => {
+      aborted = true;
+      reader.cancel().catch(() => {});
     };
-    req.on('close', onClientClose);
+    req.on('close', onClose);
 
-    await new Promise<void>((resolve, reject) => {
-      nodeStream.on('error', reject);
-      res.on('error', reject);
-      res.on('finish', resolve);
-      nodeStream.pipe(res);
-    }).finally(() => {
-      req.off('close', onClientClose);
-    });
-  } catch (err: unknown) {
+    try {
+      while (!aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          const canContinue = res.write(Buffer.from(value));
+          if (!canContinue) {
+            await new Promise((resolve) => res.once('drain', resolve));
+          }
+        }
+      }
+      if (!res.writableEnded) {
+        res.end();
+      }
+    } finally {
+      req.off('close', onClose);
+      reader.cancel().catch(() => {});
+    }
+  } catch (err) {
     if (!res.headersSent) {
       const message =
         err instanceof Error && err.name === 'AbortError'
@@ -407,7 +544,7 @@ export async function handleVideoProxy(req: IncomingMessage, res: ServerResponse
   }
 }
 
-function decodeHtmlEntities(input: string): string {
+function decodeHtmlEntities(input) {
   return input
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
@@ -416,76 +553,63 @@ function decodeHtmlEntities(input: string): string {
     .replace(/&gt;/g, '>');
 }
 
-function extractDirectVideoCandidatesFromHtml(html: string, baseUrl: string): string[] {
-  const found: string[] = [];
-  const patterns: RegExp[] = [
+function extractDirectVideoCandidatesFromHtml(html, baseUrl) {
+  const found = [];
+
+  const pushCandidate = (raw) => {
+    const cleaned = decodeHtmlEntities(raw.replace(/\\\//g, '/').replace(/\\u0026/gi, '&')).trim();
+    if (!cleaned || cleaned.startsWith('data:') || cleaned.startsWith('blob:')) return;
+    try {
+      const resolved = new URL(cleaned, baseUrl).href;
+      if (
+        (resolved.startsWith('http://') || resolved.startsWith('https://')) &&
+        !found.includes(resolved)
+      ) {
+        found.push(resolved);
+      }
+    } catch {
+      // Ignore malformed candidate
+    }
+  };
+
+  const patterns = [
+    // HTML5 <video src="..."> and <source src="...">
+    /<(?:video|source)[^>]+src=["']([^"']+)["']/gi,
     // OpenGraph & Twitter stream meta tags
     /<meta[^>]+(?:property|name)=["'](?:og:video:secure_url|og:video:url|og:video|twitter:player:stream)["'][^>]+content=["']([^"']+)["']/gi,
     /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:video:secure_url|og:video:url|og:video|twitter:player:stream)["']/gi,
-    // HTML5 <video src="..."> and <source src="...">
-    /<(?:video|source)[^>]+src=["']([^"']+)["']/gi,
-    // JSON-LD "contentUrl": "https://...mp4"
-    /"contentUrl"\s*:\s*"(https?:\\\/\\\/[^"]+|https?:\/\/[^"]+)"/gi,
+    // JSON-LD "contentUrl"
+    /"contentUrl"\s*:\s*"((?:https?:)?(?:\\\/|\/){2}[^"]+)"/gi,
+    // Embedded HLS playlist URLs in player scripts (including Bunny Stream vz-*.b-cdn.net/.../playlist.m3u8)
+    /["']((?:https?:)?(?:\\\/|\/){2}[^"'<>\s]+?\.m3u8(?:\?[^"'<>\s]*)?)["']/gi,
+    // Embedded direct MP4 / WebM URLs in player scripts
+    /["']((?:https?:)?(?:\\\/|\/){2}[^"'<>\s]+?\.(?:mp4|webm|mov|m4v)(?:\?[^"'<>\s]*)?)["']/gi,
   ];
 
   for (const regex of patterns) {
-    let match: RegExpExecArray | null;
+    let match;
     while ((match = regex.exec(html)) !== null) {
-      const rawCandidate = decodeHtmlEntities(match[1].replace(/\\\//g, '/')).trim();
-      if (!rawCandidate || rawCandidate.startsWith('data:') || rawCandidate.startsWith('blob:')) {
-        continue;
-      }
-      try {
-        const resolved = new URL(rawCandidate, baseUrl).href;
-        if (!found.includes(resolved)) {
-          found.push(resolved);
-        }
-      } catch {
-        // Ignore malformed relative candidates
-      }
+      pushCandidate(match[1]);
     }
   }
 
-  // Prioritize URLs that clearly look like direct MP4/WebM/OGV/MOV media files
-  return found.sort((a, b) => {
-    const aDirect = VIDEO_FILE_EXT_RE.test(a) ? 0 : 1;
-    const bDirect = VIDEO_FILE_EXT_RE.test(b) ? 0 : 1;
-    return aDirect - bDirect;
-  });
-}
+  const rank = (url) => {
+    if (/\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(url)) return 0;
+    if (HLS_EXT_RE.test(url)) return 1;
+    return 2;
+  };
 
-async function readLimitedText(response: Response, maxBytes: number): Promise<string> {
-  if (!response.body) return '';
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-
-  try {
-    while (total < maxBytes) {
-      const { done, value } = await reader.read();
-      if (done || !value) break;
-      const slice = total + value.byteLength > maxBytes ? value.subarray(0, maxBytes - total) : value;
-      chunks.push(slice);
-      total += slice.byteLength;
-    }
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-
-  const combined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder('utf-8', { fatal: false }).decode(combined);
+  return found.sort((a, b) => rank(a) - rank(b));
 }
 
 /**
- * Inspects a user-supplied URL to determine whether it is a direct video stream
- * or an HTML webpage exposing a direct playable HTML5 video URL.
+ * Inspects a user-supplied URL to determine whether it is a direct video file,
+ * an HLS .m3u8 stream, or an HTML embed page exposing a playable HTML5/HLS stream.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @returns {Promise<void>}
  */
-export async function handleResolveVideo(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleResolveVideo(req, res) {
   if (req.method !== 'GET') {
     sendJson(res, 405, { ok: false, error: 'Only GET requests are supported.' });
     return;
@@ -500,15 +624,15 @@ export async function handleResolveVideo(req: IncomingMessage, res: ServerRespon
   try {
     const { response, finalUrl } = await safeFetchFollowingRedirects(targetUrl, {
       method: 'GET',
-      rangeHeader: 'bytes=0-65535',
-      acceptHeader: 'video/*, text/html;q=0.9, */*;q=0.5',
+      acceptHeader:
+        'text/html, application/xhtml+xml, video/*, application/vnd.apple.mpegurl, */*;q=0.8',
     });
 
     if (!response.ok && response.status !== 206) {
       await response.body?.cancel().catch(() => {});
       sendJson(res, 200, {
         ok: false,
-        error: `Remote server returned HTTP ${response.status} when checking this URL.`,
+        error: `Remote server returned HTTP ${response.status} when checking this URL (token may be expired or access restricted).`,
       });
       return;
     }
@@ -516,47 +640,72 @@ export async function handleResolveVideo(req: IncomingMessage, res: ServerRespon
     const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
 
     if (isAllowedMediaContentType(contentType, finalUrl)) {
+      const hls = isHlsContentType(contentType, finalUrl);
       await response.body?.cancel().catch(() => {});
       sendJson(res, 200, {
         ok: true,
         kind: 'direct',
+        streamFormat: hls ? 'hls' : 'file',
         resolvedUrl: finalUrl,
         contentType: contentType.split(';')[0].trim() || inferMimeFromUrl(finalUrl),
       });
       return;
     }
 
-    if (contentType.includes('text/html')) {
+    if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
       const html = await readLimitedText(response, MAX_HTML_INSPECT_BYTES);
+      const embedOrigin = `${new URL(finalUrl).origin}/`;
       const candidates = extractDirectVideoCandidatesFromHtml(html, finalUrl);
 
-      for (const candidate of candidates.slice(0, 5)) {
+      for (const candidate of candidates.slice(0, 8)) {
         try {
+          const isCandidateHls = HLS_EXT_RE.test(candidate);
           const probe = await safeFetchFollowingRedirects(candidate, {
-            method: 'HEAD',
-            acceptHeader: 'video/*, audio/*, application/octet-stream;q=0.9',
+            method: isCandidateHls ? 'GET' : 'HEAD',
+            refererOrigin: embedOrigin,
+            acceptHeader: isCandidateHls
+              ? 'application/vnd.apple.mpegurl, application/x-mpegurl, text/plain, */*'
+              : 'video/*, audio/*, application/octet-stream;q=0.9',
           });
-          const probeType = (probe.response.headers.get('content-type') ?? '').toLowerCase();
-          await probe.response.body?.cancel().catch(() => {});
 
-          if ((probe.response.ok || probe.response.status === 206) && isAllowedMediaContentType(probeType, probe.finalUrl)) {
-            sendJson(res, 200, {
-              ok: true,
-              kind: 'extracted',
-              resolvedUrl: probe.finalUrl,
-              contentType: probeType.split(';')[0].trim() || inferMimeFromUrl(probe.finalUrl),
-            });
-            return;
+          const probeType = (probe.response.headers.get('content-type') ?? '').toLowerCase();
+          if (probe.response.ok || probe.response.status === 206) {
+            if (isHlsContentType(probeType, probe.finalUrl)) {
+              const snippet = await readLimitedText(probe.response, 4096);
+              if (snippet.trimStart().startsWith('#EXTM3U')) {
+                sendJson(res, 200, {
+                  ok: true,
+                  kind: 'extracted',
+                  streamFormat: 'hls',
+                  resolvedUrl: probe.finalUrl,
+                  refererOrigin: embedOrigin,
+                  contentType: 'application/vnd.apple.mpegurl',
+                });
+                return;
+              }
+            } else if (isAllowedMediaContentType(probeType, probe.finalUrl)) {
+              await probe.response.body?.cancel().catch(() => {});
+              sendJson(res, 200, {
+                ok: true,
+                kind: 'extracted',
+                streamFormat: 'file',
+                resolvedUrl: probe.finalUrl,
+                refererOrigin: embedOrigin,
+                contentType: probeType.split(';')[0].trim() || inferMimeFromUrl(probe.finalUrl),
+              });
+              return;
+            }
           }
+          await probe.response.body?.cancel().catch(() => {});
         } catch {
-          // Try next candidate if any
+          // Try next discovered candidate
         }
       }
 
       sendJson(res, 200, {
         ok: false,
         error:
-          'This link points to an HTML webpage without a publicly accessible direct HTML5 video file (for example, a DRM-protected or JavaScript-rendered streaming player). Paste a direct .mp4/.webm video link or load a local video file.',
+          'This webpage did not expose an accessible HTML5 video or HLS stream (it may require an expired token, domain-locked referrer, or DRM decryption). Provide a direct .mp4/.webm/.m3u8 link or a valid embed link.',
       });
       return;
     }
@@ -566,7 +715,7 @@ export async function handleResolveVideo(req: IncomingMessage, res: ServerRespon
       ok: false,
       error: `This URL returned "${contentType || 'unknown content'}" rather than a playable video file.`,
     });
-  } catch (err: unknown) {
+  } catch (err) {
     const message =
       err instanceof Error && err.name === 'AbortError'
         ? 'Timed out while inspecting the remote URL.'

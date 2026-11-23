@@ -1,3 +1,4 @@
+import Hls from 'hls.js';
 import {
   buildRecorderOptions,
   captureMediaElementStream,
@@ -20,6 +21,8 @@ import type {
 import {
   buildSameOriginProxyUrl,
   classifyVideoLoadError,
+  isLikelyEmbedPageUrl,
+  isLikelyHlsUrl,
   resolveRemoteVideoUrl,
   validateVideoUrl,
 } from './videoLoader';
@@ -46,8 +49,9 @@ export class VideoRecordingEngine {
   private capabilities: BrowserCapabilities = detectBrowserCapabilities();
   private snapshot: EngineSnapshot;
 
-  // Source blob & proxy fallback tracking
+  // Source blob, HLS, & proxy fallback tracking
   private activeOwnedSourceBlobUrl: string | null = null;
+  private hlsInstance: Hls | null = null;
   private loadSequenceId = 0;
   private hasTriedProxyFallback = false;
 
@@ -183,6 +187,17 @@ export class VideoRecordingEngine {
     this.stopTimers();
   }
 
+  private destroyHlsInstance(): void {
+    if (this.hlsInstance) {
+      try {
+        this.hlsInstance.destroy();
+      } catch {
+        // Ignore teardown errors
+      }
+      this.hlsInstance = null;
+    }
+  }
+
   public destroy(): void {
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
       try {
@@ -191,6 +206,7 @@ export class VideoRecordingEngine {
         // Ignore teardown errors
       }
     }
+    this.destroyHlsInstance();
     this.detachVideoElement();
     revokeObjectUrlSafe(this.activeOwnedSourceBlobUrl);
     revokeObjectUrlSafe(this.snapshot.recording.finalized?.objectUrl);
@@ -240,6 +256,7 @@ export class VideoRecordingEngine {
 
     this.loadSequenceId += 1;
     this.hasTriedProxyFallback = false;
+    this.destroyHlsInstance();
 
     this.video.pause();
     this.video.removeAttribute('src');
@@ -276,6 +293,17 @@ export class VideoRecordingEngine {
       errorMessage: null,
     };
     this.emit();
+
+    // Fast-path embed player URLs (e.g. Bunny Stream iframe.mediadelivery.net) and HLS .m3u8 streams
+    if (isRemote && (isLikelyEmbedPageUrl(validation.normalizedUrl) || isLikelyHlsUrl(validation.normalizedUrl))) {
+      this.hasTriedProxyFallback = true;
+      this.snapshot.video.loadProgress = 15;
+      this.snapshot.recording.statusMessage =
+        'Resolving embedded video stream through same-origin media proxy…';
+      this.emit();
+      void this.attemptSameOriginProxyFallback(validation.normalizedUrl, this.loadSequenceId);
+      return true;
+    }
 
     this.video.src = validation.normalizedUrl;
     this.video.load();
@@ -1009,6 +1037,79 @@ export class VideoRecordingEngine {
     this.emit();
   };
 
+  private attachHlsStream(manifestProxyUrl: string, seqId: number): void {
+    if (!this.video) return;
+    this.destroyHlsInstance();
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        maxBufferLength: 30,
+      });
+      this.hlsInstance = hls;
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (seqId !== this.loadSequenceId) return;
+        this.snapshot.video.loadProgress = 65;
+        this.emit();
+      });
+
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (seqId !== this.loadSequenceId) return;
+        if (!data.fatal) return;
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          if (this.snapshot.recording.isRecordingActive) {
+            this.pauseForInterruption(
+              navigator.onLine ? 'buffering' : 'offline',
+              navigator.onLine
+                ? 'HLS stream interrupted — recording auto-paused while reconnecting.'
+                : 'Network disconnected — recording auto-paused until connection returns.'
+            );
+            hls.startLoad();
+            return;
+          }
+          this.destroyHlsInstance();
+          this.snapshot.video.isLoaded = false;
+          this.snapshot.video.loadProgress = 0;
+          this.snapshot.video.errorMessage =
+            'Unable to fetch HLS video segments from the remote server. The stream token may have expired or access may be restricted.';
+          this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
+          this.snapshot.recording.statusMessage = 'HLS stream failed to load.';
+          this.emit();
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+        } else {
+          this.destroyHlsInstance();
+          this.snapshot.video.isLoaded = false;
+          this.snapshot.video.loadProgress = 0;
+          this.snapshot.video.errorMessage =
+            'Fatal HLS playback error. This stream may use unsupported encryption or DRM.';
+          this.snapshot.recording.status = this.snapshot.recording.isOnline ? 'ready' : 'offline';
+          this.snapshot.recording.statusMessage = 'HLS stream failed to decode.';
+          this.emit();
+        }
+      });
+
+      hls.loadSource(manifestProxyUrl);
+      hls.attachMedia(this.video);
+      return;
+    }
+
+    // Native Safari HLS support
+    if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
+      this.video.src = manifestProxyUrl;
+      this.video.load();
+      return;
+    }
+
+    this.snapshot.video.errorMessage =
+      'This browser does not support HLS (.m3u8) Media Source playback.';
+    this.snapshot.recording.status = 'ready';
+    this.emit();
+  }
+
   private async attemptSameOriginProxyFallback(remoteUrl: string, seqId: number): Promise<void> {
     const resolved = await resolveRemoteVideoUrl(remoteUrl);
     if (seqId !== this.loadSequenceId || !this.video) return;
@@ -1027,26 +1128,33 @@ export class VideoRecordingEngine {
       return;
     }
 
-    const proxyUrl = buildSameOriginProxyUrl(resolved.resolvedUrl);
+    const proxyUrl = buildSameOriginProxyUrl(resolved.resolvedUrl, resolved.refererOrigin);
     this.video.pause();
     this.video.removeAttribute('crossorigin');
+
+    const isHls = resolved.streamFormat === 'hls' || isLikelyHlsUrl(resolved.resolvedUrl);
 
     this.snapshot.video = {
       ...this.snapshot.video,
       viaProxy: true,
       isLoaded: false,
-      loadProgress: 25,
+      loadProgress: 30,
       errorMessage: null,
     };
     this.snapshot.recording.status = 'loading';
-    this.snapshot.recording.statusMessage =
-      resolved.kind === 'extracted'
+    this.snapshot.recording.statusMessage = isHls
+      ? 'HLS stream resolved — loading playlist through same-origin proxy…'
+      : resolved.kind === 'extracted'
         ? 'Direct video stream found on page — loading through same-origin proxy…'
         : 'Remote server lacks CORS headers — streaming through same-origin proxy…';
     this.emit();
 
-    this.video.src = proxyUrl;
-    this.video.load();
+    if (isHls) {
+      this.attachHlsStream(proxyUrl, seqId);
+    } else {
+      this.video.src = proxyUrl;
+      this.video.load();
+    }
   }
 
   private onVideoError = (): void => {
